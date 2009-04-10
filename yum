@@ -1,0 +1,358 @@
+#!/usr/bin/python
+
+import logging
+import time
+import bz2
+import gzip
+import re
+import os
+import urllib
+import tarfile
+import subprocess
+import fnmatch
+import ConfigParser
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger()
+
+class Repo(object):
+
+    def __init__(self, name, mirror):
+        self.name = name
+        self.mirror = mirror
+        self.packages = {}
+
+        setup_file = self.fetch('setup.bz2', expires=3600*12)
+        f = bz2.BZ2File(setup_file)
+
+        package = None
+        in_quoted_string = False
+
+        for l in f.readlines():
+            l = l.strip()
+
+            if in_quoted_string:
+                if l.endswith('"'):
+                    package.setattr(attr, value, ver=ver)
+                    in_quoted_string = False
+                else:
+                    value += '\n' + l
+
+            elif not l or l[0] == '#':
+                continue
+
+            elif l[0] == '@':
+                name = l[2:]
+                package = Package(name, self)
+                self.packages[name] = package
+                ver = 'cur'
+
+            else:
+                m = re.match(r'^\[([a-z]+)\]$', l)
+                if m:
+                    ver = m.group(1)
+                    continue
+
+                m = re.match(r'(^[a-z-]+): (.*)$', l)
+                if m:
+                    attr, value = m.group(1), m.group(2)
+
+                    if attr == 'setup-timestamp':
+                        self.setup_timestamp = value
+                        continue
+
+                    elif attr == 'setup-version':
+                        self.setup_version = value
+                        continue
+
+                    if not package:
+                        raise
+
+                    if value.startswith('"'):
+                        value = value[1:]
+                        if value.endswith('"'):
+                            value = value[:-1]
+                        else:
+                            in_quoted_string = True
+                            continue
+
+                    package.setattr(attr, value, ver=ver)
+                    continue
+
+                print l, "?"
+
+    def fetch(self, path, size=None, md5=None, expires=None):
+        url = config.get(self.name, 'mirror') + path
+        local_path = yum.makepath('/var/cache/yum', self.name, path)
+
+        filename = os.path.basename(local_path)
+        local_dir = os.path.dirname(local_path)
+
+        if not os.path.isdir(local_dir):
+            os.makedirs(local_dir)
+        
+        if os.path.isfile(local_path) and (not expires or os.stat(local_path).st_mtime + expires >= time.time()):
+            log.debug("cached: %s", local_path)
+        else:
+            log.info("downloading: %s", url)
+            urllib.urlretrieve(url, local_path)
+
+        return local_path
+        
+    def __repr__(self):
+        return self.name
+
+class Package(object):
+    def __init__(self, name, repo):
+        self.name = name
+        self.repo = repo
+        self.attrs = {}
+
+    def setattr(self, attr, value, ver='cur'):
+        attrs = self.attrs.setdefault(ver, {})
+        attrs[attr] = value
+        
+    def getattr(self, attr, ver='cur'):
+        return self.attrs[ver].get(attr)
+    
+    def requires(self):
+        requires = self.getattr('requires')
+        if requires:
+            return requires.split()
+        else:
+            return []
+
+    def dependencies(self):
+        def add_dependencies(package, deps):
+            for pkg in package.requires():
+                package = yum.packages[pkg] ####
+                if not package in deps:
+                    deps.add(package)
+                    add_dependencies(package, deps)
+            return deps
+
+        return add_dependencies(self, set())
+
+    def is_installed(self):
+        try:
+            pkg, filename, status = yum.installed[self.name] ###
+            return status == '0'
+        except KeyError:
+            return False
+
+    def installed_version(self):
+        pkg, filename, status = yum.installed[self.name]
+        version = filename
+        version = version.replace('%s-' % pkg, '')
+        version = version.replace('.tar.bz2', '')
+        return version
+        
+    def is_updated(self):
+        pass
+
+    def download(self):
+        install = self.getattr("install")
+        path, size, md5 = install.split()
+        self.local_path = self.repo.fetch(path, size=size, md5=md5)
+
+    def extract(self):
+        self.file_lst = []
+        tar = tarfile.open(self.local_path, "r")
+        for tarinfo in tar:
+            self.file_lst.append(tarinfo.name)
+            #log.debug("%s", tarinfo.name)
+            tar.extract(tarinfo, yum.makepath('/'))
+
+        f = gzip.open(yum.makepath('/etc/setup/', self.name + '.lst.gz'), 'w')
+        f.write('\n'.join(self.file_lst))
+        f.close()
+        
+    def postinstall(self):
+        for ext in ['.sh', '.bat']:
+            script = yum.makepath('/etc/postinstall', self.name + ext)
+            if os.path.isfile(script):
+                log.debug("running: %s", script)
+                subprocess.call(script)
+
+    def install(self):
+        self.download()
+        self.extract()
+        self.postinstall()
+        
+    def __repr__(self):
+        return "%s" % (self.name)
+
+class Yum(object):
+    def __init__(self):
+        self.read_installed()
+
+    def init_repos(self):
+        self.repos = []
+        self.packages = {}
+        for section in config.sections():
+            if section != 'main':
+                repo = Repo(section, config.get(section, 'mirror'))
+                print "* %s: %s" % (repo.name, repo.mirror)
+                self.repos.append(repo)
+                self.packages.update(repo.packages)
+
+    def makepath(self, *args):
+        return os.path.join('/', *args)
+
+    def read_installed(self):
+        self.installed = {}
+
+        f = open(self.makepath('/etc/setup/installed.db'))
+        self.installed_magic = f.readline()
+        for l in f.readlines():
+            pkg, filename, status = l.split()
+            self.installed[pkg] = (pkg, filename, status)
+
+    def write_installed(self):
+        f = open(self.makepath('/etc/setup/installed.db'), 'w')
+        f.write(self.installed_magic)
+        for pkg in sorted(self.installed):
+            f.write("%s %s %s\n" % self.installed[pkg])
+        
+    def resolve(self, packages):
+        pkgs = set()
+        resolved = []
+
+        for package in packages:
+            if not package.is_installed():
+                log.debug("requires: %s --> %s", package, package.requires())
+                pkgs |= package.dependencies()
+            else:
+                print package, "already installed"
+
+        while pkgs:
+            no_deps = set(package for package in pkgs if not package.dependencies().intersection(pkgs))
+            if no_deps:
+                resolved.extend(no_deps)
+                pkgs -= no_deps
+            else:
+                log.debug("Cant resolve dependency order: %s", pkgs)
+                resolved.extend(pkgs)
+                break
+
+        return resolved
+
+    def install(self, args):
+        install = []
+        update = []
+
+        for package in self.package_list(args):
+            if not package.is_installed() or options.force:
+                install.append(package)
+            elif package.is_updated():
+                update.append(package)
+
+        if not (install or update):
+            return
+
+        dependencies = self.resolve(install)
+
+        install_dep = [package for package in dependencies if not package.is_installed()]
+        update_dep = [package for package in dependencies if package.is_updated()]
+
+        print "="*50
+
+        print "Installing:"
+        for package in install:
+            print package
+
+        if update:
+            print "Updating:"
+            for package in update:
+                print package
+
+        if install_dep:
+            print "Installing for dependencies:"
+            for package in install_dep:
+                print package, package.getattr('version')
+
+        if update_dep:
+            print "Updating for dependencies:"
+            for package in update_dep:
+                print package, package.getattr('version')
+        print
+        print "="*50
+        print "Total download size"
+        print "Is this ok [y/N]",
+
+        if not options.assume_yes:
+            if raw_input().lower() not in ['y', 'yes']:
+                return
+        
+        for package in install:
+            print package, package.getattr('install')
+
+        for package in install_dep + install:
+            print package
+            package.install()
+            self.installed[package.name] = (package.name, '%s-%s' % (package.name, package.getattr('version')), '0')
+
+        self.write_installed()
+
+    def package_list(self, args):
+        packages = []
+        for package in self.packages.values():
+            if not args or [True for a in args if fnmatch.fnmatch(package.name, a)]:
+                packages.append(package)
+
+        packages.sort(key=lambda x: x.name)
+
+        if args and not packages:
+            print "Error: No matching Packages"
+
+        return packages
+        
+    def list(self, args):
+        for package in self.package_list(args):
+            print "%-30s %c %-20s %-20s" % (package, package.is_installed() and "*" or " ", package.getattr('version'), package.repo)
+
+    def check_update(self, args):
+        for package in self.package_list(args):
+            if package.is_installed():
+                if package.getattr('version') != package.installed_version():
+                    print package, 'installed', package.getattr('version'), package.repo, package.installed_version()
+            
+        
+    def info(self, args):
+        for package in self.package_list(args):
+            print "Name    :", package.name
+            print "Version :", package.getattr('version')
+            print "Category:", package.getattr('category')
+            print "Requires:", package.getattr('requires')
+            print "Summary :", package.getattr('sdesc')
+            print "Description:"
+            print package.getattr('ldesc')
+            print
+
+if __name__=="__main__":
+    from optparse import OptionParser
+    parser = OptionParser()
+    parser.add_option("-y", action="store_true", dest="assume_yes")
+    parser.add_option("--root", action="store", dest="root", default="/")
+    parser.add_option("--force", action="store_true", dest="force")
+    (options, args) = parser.parse_args()
+
+    config = ConfigParser.ConfigParser()
+    config.read(os.path.join(options.root, 'etc/yum.conf'))
+
+    yum = Yum()
+    yum.init_repos()
+
+    if len(args) > 0:
+        cmd = args[0]
+        if cmd == 'list':
+            yum.list(args[1:])
+
+        elif cmd == 'install':
+            yum.install(args[1:])
+
+        elif cmd == 'check-update':
+            yum.check_update(args[1:])
+
+        elif cmd == 'info':
+            yum.info(args[1:])
